@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+
+server.log
+server.err.log
+*.log
+
+data/byd-flash-stations.json
+data/byd-summary.json

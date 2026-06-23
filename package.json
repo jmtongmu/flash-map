@@ -1,0 +1,13 @@
+{
+  "name": "flash-power-map",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BYD flash charging and NIO power swap network map powered by AMap.",
+  "scripts": {
+    "start": "node server.js",
+    "serve": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

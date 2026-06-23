@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>全国闪充与换电网络地图</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <h1>全国闪充与换电网络地图</h1>
+            <p>高德充电地图 POI · BYD 闪充 · NIO 换电</p>
+          </div>
+        </div>
+        <section class="metric-strip" aria-label="网络总览">
+          <article class="metric">
+            <span>比亚迪点位</span>
+            <strong id="metric-byd-stations">--</strong>
+          </article>
+          <article class="metric">
+            <span>高德点位</span>
+            <strong id="metric-byd-connectors">--</strong>
+          </article>
+          <article class="metric">
+            <span>营业时间</span>
+            <strong id="metric-byd-available">--</strong>
+          </article>
+          <article class="metric nio">
+            <span>蔚来点位</span>
+            <strong id="metric-nio-stations">--</strong>
+          </article>
+        </section>
+      </header>
+
+      <main class="workbench">
+        <aside class="sidebar" aria-label="筛选">
+          <div class="panel-section compact">
+            <label class="search-field">
+              <span>搜索</span>
+              <input id="search-input" type="search" placeholder="站名、城市、地址" autocomplete="off" />
+            </label>
+            <div class="segmented" role="group" aria-label="网络">
+              <button class="segment active" data-provider="all" type="button">全部</button>
+              <button class="segment" data-provider="BYD" type="button">比亚迪</button>
+              <button class="segment" data-provider="NIO" type="button">蔚来</button>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-head">
+              <h2>站点类型</h2>
+              <button class="icon-btn" id="reset-filters" title="重置筛选" type="button" aria-label="重置筛选">
+                <span class="icon-reset" aria-hidden="true"></span>
+              </button>
+            </div>
+            <div class="check-grid" id="category-filters"></div>
+          </div>
+
+          <div class="panel-section">
+            <div class="range-row">
+              <label for="min-available">最少空闲</label>
+              <output id="min-available-label">0</output>
+            </div>
+            <input id="min-available" type="range" min="0" max="12" step="1" value="0" />
+            <div class="range-row">
+              <label for="max-price">电价上限</label>
+              <output id="max-price-label">不限</output>
+            </div>
+            <input id="max-price" type="range" min="0" max="2.5" step="0.05" value="2.5" />
+          </div>
+
+          <div class="panel-section">
+            <div class="section-head">
+              <h2>高德数据源</h2>
+              <span class="source-pill">充电/换电 POI</span>
+            </div>
+            <label class="search-field small">
+              <span>城市</span>
+              <input id="nio-city-input" type="text" value="上海市" autocomplete="off" />
+            </label>
+            <div class="button-row">
+              <button id="load-nio-city" class="primary-btn" type="button">加载城市</button>
+              <button id="load-nio-batch" class="secondary-btn" type="button">补全省级</button>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-head">
+              <h2>站点列表</h2>
+              <span id="filtered-count" class="count-pill">--</span>
+            </div>
+            <div id="station-list" class="station-list" aria-label="站点列表"></div>
+          </div>
+        </aside>
+
+        <section class="map-stage" aria-label="地图">
+          <div id="map" class="map"></div>
+          <div id="fallback-map" class="fallback-map" hidden></div>
+          <div class="map-toolbar">
+            <button id="fit-map" class="tool-btn" type="button">适配视野</button>
+            <button id="toggle-density" class="tool-btn" type="button">热度</button>
+          </div>
+          <div id="map-status" class="map-status">地图加载中</div>
+        </section>
+
+        <aside class="detail-panel" aria-label="统计与站点详情">
+          <section class="insight-panel" aria-label="统计可视化">
+            <div class="section-head">
+              <h2>统计可视化</h2>
+              <span id="insight-scope" class="source-pill">当前筛选</span>
+            </div>
+            <div class="insight-tabs" role="group" aria-label="统计类型">
+              <button class="insight-tab active" data-insight="density" type="button">密度</button>
+              <button class="insight-tab" data-insight="velocity" type="button">速度</button>
+              <button class="insight-tab" data-insight="demand" type="button">需求</button>
+            </div>
+            <div id="insight-content" class="insight-content"></div>
+          </section>
+          <div id="detail-content"></div>
+        </aside>
+      </main>
+    </div>
+
+    <template id="empty-detail">
+      <div class="empty-detail">
+        <span class="empty-icon" aria-hidden="true"></span>
+        <h2>选择一个站点</h2>
+        <p>查看高德点位、营业时间、POI 来源和实时字段覆盖情况。</p>
+      </div>
+    </template>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

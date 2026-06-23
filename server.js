@@ -1,0 +1,521 @@
+const http = require("http");
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+
+const root = __dirname;
+const port = Number(process.env.PORT || 8585);
+const amapKey = process.env.AMAP_KEY || "33e77f9a83c7250dfbdda86ca642682c";
+const amapNetworkCache = new Map();
+const cacheTtlMs = 10 * 60 * 1000;
+const dataDir = path.join(root, "data");
+const localLibraryPath = path.join(dataDir, "amap-stations-cache.json");
+const localLibraryVersion = 1;
+let localLibraryMemo = null;
+const defaultCities = ["深圳市", "上海市", "北京市", "广州市", "杭州市", "苏州市", "南京市", "成都市", "武汉市", "西安市"];
+
+const searchProfiles = [
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "比亚迪闪充", defaultPages: 1, deepPages: 3, default: true },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "比亚迪兆瓦闪充", defaultPages: 1, deepPages: 3, default: true },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "比亚迪超充", defaultPages: 1, deepPages: 2 },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "比亚迪汽车充电站", defaultPages: 1, deepPages: 2 },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "比亚迪闪充服务区", defaultPages: 1, deepPages: 2 },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "比亚迪闪充高速", defaultPages: 1, deepPages: 2 },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "比亚迪兆瓦闪充服务区", defaultPages: 1, deepPages: 2 },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "腾势闪充", defaultPages: 1, deepPages: 2 },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "方程豹闪充", defaultPages: 1, deepPages: 2 },
+  { provider: "BYD", network: "比亚迪高德充电", keyword: "仰望闪充", defaultPages: 1, deepPages: 2 },
+  { provider: "NIO", network: "蔚来换电", keyword: "蔚来换电站", defaultPages: 1, deepPages: 3, default: true },
+  { provider: "NIO", network: "蔚来换电", keyword: "蔚来换电服务区", defaultPages: 1, deepPages: 2 },
+  { provider: "NIO", network: "蔚来换电", keyword: "蔚来高速换电", defaultPages: 1, deepPages: 2 },
+  { provider: "NIO", network: "蔚来换电", keyword: "NIO Power", defaultPages: 1, deepPages: 2 }
+];
+
+const types = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp"
+};
+
+function send(res, status, body, contentType = "text/plain; charset=utf-8") {
+  res.writeHead(status, {
+    "content-type": contentType,
+    "cache-control": "no-store"
+  });
+  res.end(body);
+}
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (upstream) => {
+        let body = "";
+        upstream.setEncoding("utf8");
+        upstream.on("data", (chunk) => {
+          body += chunk;
+        });
+        upstream.on("end", () => {
+          try {
+            resolve(JSON.parse(body));
+          } catch (error) {
+            reject(error);
+          }
+        });
+      })
+      .on("error", reject);
+  });
+}
+
+function cleanText(value) {
+  if (Array.isArray(value)) return "";
+  return String(value ?? "").trim();
+}
+
+function parsePoiLocation(location) {
+  const [lng, lat] = cleanText(location).split(",").map(Number);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null;
+  return { lng, lat };
+}
+
+function inferCategory(poi, provider) {
+  if (provider === "NIO" || cleanText(poi.typecode) === "011101" || /换电/.test(cleanText(poi.type))) {
+    return "换电站";
+  }
+
+  const text = `${cleanText(poi.name)} ${cleanText(poi.address)} ${cleanText(poi.business_area)}`;
+  if (/高速|服务区|收费站|枢纽|互通/.test(text)) return "高速站";
+  if (/4S|汽车城|销售|展厅|体验中心|王朝|海洋|腾势|方程豹|仰望|门店|店/.test(text)) return "4S站";
+  return "开放站";
+}
+
+function normalizePoi(poi, profile) {
+  const location = parsePoiLocation(poi.location);
+  if (!location) return null;
+
+  const name = cleanText(poi.name);
+  const address = cleanText(poi.address || poi.adname || "");
+  const searchable = `${name} ${address} ${cleanText(poi.type)} ${cleanText(poi.keytag)}`;
+  const hasNioBrand = /蔚来|NIO/i.test(searchable);
+  const hasBydBrand = /(比亚迪|BYD|腾势|方程豹|仰望)/i.test(searchable);
+  const provider = hasNioBrand
+    ? "NIO"
+    : hasBydBrand
+      ? "BYD"
+      : null;
+  if (profile.provider === "BYD" && provider !== "BYD") return null;
+  if (profile.provider === "NIO" && provider !== "NIO") return null;
+  if (profile.provider === "AUTO" && provider !== "BYD" && provider !== "NIO") return null;
+
+  const category = inferCategory(poi, provider);
+  const openTime = cleanText(poi.biz_ext?.open_time) || cleanText(poi.biz_ext?.opentime2);
+  const isFlash = /闪充|兆瓦|超充/i.test(searchable);
+  const network = provider === "NIO" ? "蔚来换电" : "比亚迪高德充电";
+  const id = `amap-${provider.toLowerCase()}-${cleanText(poi.id) || `${name}-${location.lng}-${location.lat}`}`;
+
+  return {
+    id,
+    provider,
+    network,
+    name,
+    city: cleanText(poi.cityname) || cleanText(poi.pname),
+    province: cleanText(poi.pname),
+    district: cleanText(poi.adname),
+    address,
+    location,
+    category,
+    connectors: provider === "NIO"
+      ? { swap: 1 }
+      : isFlash
+        ? { flash: 1 }
+        : { fast: 1 },
+    available: {},
+    price: { currentElecFee: null, currentServiceFee: null, periods: [] },
+    businessHours: openTime || "以高德地图详情为准",
+    parkFee: "以高德地图/现场为准",
+    phone: cleanText(poi.tel),
+    rating: cleanText(poi.biz_ext?.rating),
+    serviceTags: ["高德POI"],
+    attributeTags: [cleanText(poi.keytag), cleanText(poi.type), cleanText(poi.business_area)].filter(Boolean),
+    swapStatus: provider === "NIO" ? "以蔚来/高德实时信息为准" : "",
+    source: {
+      confidence: "amap-poi",
+      label: `高德充电地图 POI：${profile.keyword}`,
+      url: "https://lbs.amap.com/api/webservice/guide/api/search",
+      capturedAt: new Date().toISOString(),
+      poiId: cleanText(poi.id),
+      typecode: cleanText(poi.typecode),
+      updatedAt: cleanText(poi.timestamp),
+      availabilityNote: "高德公开 POI 接口未返回实时可用桩数量",
+      priceNote: "高德公开 POI 接口未返回实时电价"
+    }
+  };
+}
+
+function stationDedupeKey(station) {
+  const poiId = cleanText(station.source?.poiId);
+  if (poiId) return `${station.provider || "AUTO"}-${poiId}`;
+  const location = station.location || {};
+  return [
+    station.provider || "AUTO",
+    cleanText(station.name),
+    Number(location.lng || 0).toFixed(6),
+    Number(location.lat || 0).toFixed(6)
+  ].join("|");
+}
+
+function mergeSourceLabels(left, right) {
+  return Array.from(new Set(
+    `${cleanText(left)} / ${cleanText(right)}`
+      .split("/")
+      .map((item) => item.trim())
+      .filter(Boolean)
+  )).join(" / ");
+}
+
+function dedupeStations(stations) {
+  const map = new Map();
+  stations.forEach((station) => {
+    const key = stationDedupeKey(station);
+    const current = map.get(key);
+    if (!current) {
+      map.set(key, station);
+      return;
+    }
+
+    const currentTags = Array.isArray(current.attributeTags) ? current.attributeTags : [];
+    const stationTags = Array.isArray(station.attributeTags) ? station.attributeTags : [];
+    const keep = {
+      ...current,
+      phone: current.phone || station.phone,
+      rating: current.rating || station.rating,
+      category: current.category === "开放站" ? station.category : current.category,
+      businessHours: current.businessHours === "以高德地图详情为准" ? station.businessHours : current.businessHours,
+      source: {
+        ...current.source,
+        ...station.source,
+        label: mergeSourceLabels(current.source?.label, station.source?.label)
+      },
+      attributeTags: Array.from(new Set([...currentTags, ...stationTags]))
+    };
+    map.set(key, keep);
+  });
+  return Array.from(map.values());
+}
+
+function localLibraryStats(stations) {
+  const stats = {
+    total: stations.length,
+    providers: {},
+    categories: {},
+    provinces: {},
+    cities: {}
+  };
+
+  stations.forEach((station) => {
+    const provider = station.provider || "UNKNOWN";
+    const category = station.category || "未分类";
+    const province = station.province || "未知省份";
+    const city = station.city || "未知城市";
+    stats.providers[provider] = (stats.providers[provider] || 0) + 1;
+    stats.categories[category] = (stats.categories[category] || 0) + 1;
+    stats.provinces[province] = (stats.provinces[province] || 0) + 1;
+    stats.cities[city] = (stats.cities[city] || 0) + 1;
+  });
+
+  return stats;
+}
+
+function emptyLocalLibrary() {
+  return {
+    schema: localLibraryVersion,
+    source: "local-library",
+    updatedAt: null,
+    count: 0,
+    stats: localLibraryStats([]),
+    stations: []
+  };
+}
+
+function sortStationsForLibrary(stations) {
+  return stations.slice().sort((left, right) => {
+    const provinceCompare = cleanText(left.province).localeCompare(cleanText(right.province), "zh-CN");
+    if (provinceCompare) return provinceCompare;
+    const cityCompare = cleanText(left.city).localeCompare(cleanText(right.city), "zh-CN");
+    if (cityCompare) return cityCompare;
+    const providerCompare = cleanText(left.provider).localeCompare(cleanText(right.provider), "zh-CN");
+    if (providerCompare) return providerCompare;
+    return cleanText(left.name).localeCompare(cleanText(right.name), "zh-CN");
+  });
+}
+
+function buildLocalLibrary(stations, updatedAt = new Date().toISOString()) {
+  const deduped = sortStationsForLibrary(dedupeStations((stations || []).filter((station) => station?.location)));
+  return {
+    schema: localLibraryVersion,
+    source: "local-library",
+    updatedAt,
+    count: deduped.length,
+    stats: localLibraryStats(deduped),
+    stations: deduped
+  };
+}
+
+function readLocalLibrary() {
+  if (localLibraryMemo) return localLibraryMemo;
+  if (!fs.existsSync(localLibraryPath)) {
+    localLibraryMemo = emptyLocalLibrary();
+    return localLibraryMemo;
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(localLibraryPath, "utf8"));
+    localLibraryMemo = buildLocalLibrary(parsed.stations || [], parsed.updatedAt || null);
+  } catch (error) {
+    localLibraryMemo = emptyLocalLibrary();
+    localLibraryMemo.error = error.message;
+  }
+  return localLibraryMemo;
+}
+
+function writeLocalLibrary(stations) {
+  const library = buildLocalLibrary(stations);
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(localLibraryPath, `${JSON.stringify(library, null, 2)}\n`, "utf8");
+  localLibraryMemo = library;
+  return library;
+}
+
+function mergeLocalLibrary(stations) {
+  const incoming = Array.isArray(stations) ? stations.filter(Boolean) : [];
+  const current = readLocalLibrary();
+  if (!incoming.length) return current;
+  return writeLocalLibrary([...current.stations, ...incoming]);
+}
+
+function localLibraryMeta(library = readLocalLibrary()) {
+  return {
+    path: "data/amap-stations-cache.json",
+    updatedAt: library.updatedAt,
+    count: library.count,
+    stats: library.stats
+  };
+}
+
+function handleLocalLibrary(res) {
+  send(res, 200, JSON.stringify({
+    ...readLocalLibrary(),
+    path: "data/amap-stations-cache.json"
+  }), "application/json; charset=utf-8");
+}
+
+function parseBoundsParam(boundsText) {
+  const values = cleanText(boundsText).split(",").map(Number);
+  if (values.length !== 4 || values.some((value) => !Number.isFinite(value))) return null;
+  const [minLng, minLat, maxLng, maxLat] = values;
+  return { minLng, minLat, maxLng, maxLat };
+}
+
+async function fetchAmapPage({ city, profile, page, offset, bounds }) {
+  const upstream = new URL(bounds ? "https://restapi.amap.com/v3/place/polygon" : "https://restapi.amap.com/v3/place/text");
+  upstream.searchParams.set("key", amapKey);
+  upstream.searchParams.set("keywords", profile.keyword);
+  if (bounds) {
+    upstream.searchParams.set("polygon", `${bounds.minLng},${bounds.minLat}|${bounds.maxLng},${bounds.maxLat}`);
+  } else if (city) {
+    upstream.searchParams.set("city", city);
+    upstream.searchParams.set("citylimit", "true");
+  }
+  upstream.searchParams.set("offset", String(offset));
+  upstream.searchParams.set("page", String(page));
+  upstream.searchParams.set("extensions", "all");
+  upstream.searchParams.set("output", "json");
+  return fetchJson(upstream);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchAmapPageWithRetry(task) {
+  const first = await fetchAmapPage(task);
+  if (first.infocode !== "10021") return first;
+  await sleep(1400);
+  return fetchAmapPage(task);
+}
+
+async function mapLimit(items, limit, worker) {
+  const results = [];
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function handleAmapPlaceSearch(url, res) {
+  const keywords = url.searchParams.get("keywords") || "";
+  const city = url.searchParams.get("city") || "";
+  const page = Math.max(1, Math.min(10, Number(url.searchParams.get("page") || 1)));
+  const offset = Math.max(1, Math.min(25, Number(url.searchParams.get("offset") || 20)));
+  if (!keywords || !city) {
+    send(res, 400, JSON.stringify({ error: "keywords and city are required" }), "application/json; charset=utf-8");
+    return;
+  }
+
+  const upstream = new URL("https://restapi.amap.com/v3/place/text");
+  upstream.searchParams.set("key", amapKey);
+  upstream.searchParams.set("keywords", keywords);
+  upstream.searchParams.set("city", city);
+  upstream.searchParams.set("citylimit", "true");
+  upstream.searchParams.set("offset", String(offset));
+  upstream.searchParams.set("page", String(page));
+  upstream.searchParams.set("extensions", "all");
+  upstream.searchParams.set("output", "json");
+
+  try {
+    const payload = await fetchJson(upstream);
+    send(res, 200, JSON.stringify(payload), "application/json; charset=utf-8");
+  } catch (error) {
+    send(res, 502, JSON.stringify({ error: "AMap request failed" }), "application/json; charset=utf-8");
+  }
+}
+
+async function handleAmapNetworkSearch(url, res) {
+  const bounds = parseBoundsParam(url.searchParams.get("bounds"));
+  const nation = url.searchParams.get("nation") === "true";
+  const keyword = cleanText(url.searchParams.get("keyword"));
+  const deep = bounds || keyword || url.searchParams.get("deep") === "true";
+  const cities = (url.searchParams.get("cities") || url.searchParams.get("city") || defaultCities.join(","))
+    .split(",")
+    .map((city) => city.trim())
+    .filter(Boolean)
+    .slice(0, 60);
+  const providers = new Set((url.searchParams.get("providers") || "BYD,NIO")
+    .split(",")
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean));
+  const maxPages = Math.max(1, Math.min(5, Number(url.searchParams.get("pages") || (deep ? 3 : 1))));
+  const offset = Math.max(1, Math.min(25, Number(url.searchParams.get("offset") || 25)));
+  const profiles = searchProfiles
+    .filter((profile) => providers.has(profile.provider))
+    .filter((profile) => deep || profile.default);
+  if (keyword) {
+    profiles.unshift({
+      provider: providers.size === 1 ? Array.from(providers)[0] : "AUTO",
+      network: "高德搜索",
+      keyword,
+      defaultPages: 1,
+      deepPages: 2,
+      default: true
+    });
+  }
+  const cacheKey = JSON.stringify({ bounds, nation, cities: bounds || nation ? [] : cities, providers: Array.from(providers).sort(), keyword, deep: Boolean(deep), maxPages, offset });
+  const cached = amapNetworkCache.get(cacheKey);
+  if (cached && Date.now() - cached.createdAt < cacheTtlMs) {
+    send(res, 200, JSON.stringify({
+      ...cached.payload,
+      cache: "hit",
+      localLibrary: localLibraryMeta()
+    }), "application/json; charset=utf-8");
+    return;
+  }
+
+  const tasks = [];
+  const queryCities = bounds || nation ? [""] : cities;
+  queryCities.forEach((city) => {
+    profiles.forEach((profile) => {
+      const profilePages = nation ? maxPages : (deep ? (profile.deepPages || profile.defaultPages) : profile.defaultPages);
+      const pages = Math.min(maxPages, profilePages);
+      for (let page = 1; page <= pages; page += 1) {
+        tasks.push({ city, profile, page, offset, bounds });
+      }
+    });
+  });
+
+  const errors = [];
+  const stations = [];
+  try {
+    await mapLimit(tasks, 1, async (task) => {
+      try {
+        await sleep(300);
+        const payload = await fetchAmapPageWithRetry(task);
+        if (payload.infocode !== "10000" || !Array.isArray(payload.pois)) {
+          errors.push({ city: task.city, keyword: task.profile.keyword, info: payload.info, infocode: payload.infocode });
+          return;
+        }
+        payload.pois.map((poi) => normalizePoi(poi, task.profile)).filter(Boolean).forEach((station) => stations.push(station));
+      } catch (error) {
+        errors.push({ city: task.city, keyword: task.profile.keyword, error: error.message });
+      }
+    });
+
+    const deduped = dedupeStations(stations);
+    let libraryMeta = localLibraryMeta();
+    try {
+      libraryMeta = localLibraryMeta(mergeLocalLibrary(deduped));
+    } catch (error) {
+      errors.push({ city: "local-library", keyword: "write-cache", error: error.message });
+    }
+    const payload = {
+      source: "amap-poi",
+      cities,
+      queriedAt: new Date().toISOString(),
+      count: deduped.length,
+      stations: deduped,
+      localLibrary: libraryMeta,
+      errors
+    };
+    amapNetworkCache.set(cacheKey, { createdAt: Date.now(), payload });
+    send(res, 200, JSON.stringify(payload), "application/json; charset=utf-8");
+  } catch (error) {
+    send(res, 502, JSON.stringify({ error: "AMap network request failed" }), "application/json; charset=utf-8");
+  }
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://localhost:${port}`);
+  if (url.pathname === "/api/amap/place") {
+    handleAmapPlaceSearch(url, res);
+    return;
+  }
+  if (url.pathname === "/api/amap/network") {
+    handleAmapNetworkSearch(url, res);
+    return;
+  }
+  if (url.pathname === "/api/local-library") {
+    handleLocalLibrary(res);
+    return;
+  }
+
+  const pathname = decodeURIComponent(url.pathname);
+  const target = pathname === "/" ? "/index.html" : pathname;
+  const resolved = path.resolve(root, `.${target}`);
+
+  if (!resolved.startsWith(root)) {
+    send(res, 403, "Forbidden");
+    return;
+  }
+
+  fs.readFile(resolved, (err, data) => {
+    if (err) {
+      send(res, 404, "Not found");
+      return;
+    }
+    send(res, 200, data, types[path.extname(resolved).toLowerCase()] || "application/octet-stream");
+  });
+});
+
+server.listen(port, () => {
+  console.log(`Flash map running at http://localhost:${port}`);
+});
