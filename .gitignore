@@ -8,3 +8,4 @@ server.err.log
 
 data/byd-flash-stations.json
 data/byd-summary.json
+data/amap-crawl-state.json

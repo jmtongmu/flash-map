@@ -234,6 +234,20 @@ async function fetchLocalLibrary() {
   return response.json();
 }
 
+async function fetchAmapCrawl(options = {}) {
+  const params = new URLSearchParams({
+    provider: options.provider || "BYD",
+    steps: String(options.steps || 24),
+    pages: String(options.pages || 5),
+    offset: "25"
+  });
+  if (options.regions?.length) params.set("regions", options.regions.join(","));
+  if (options.reset) params.set("reset", "true");
+  const response = await fetch(`/api/amap/crawl?${params.toString()}`);
+  if (!response.ok) throw new Error("AMap crawl failed");
+  return response.json();
+}
+
 function rememberLoadedRegions(stations) {
   (stations || []).forEach((station) => {
     if (station.city) state.loadedAmapCities.add(station.city);
@@ -1261,10 +1275,25 @@ function bindEvents() {
   });
 
   el.loadNioBatch.addEventListener("click", async () => {
-    setMapStatus("正在按省份补充全国高德 POI；点击省份后会继续深度补充高速服务区关键词...");
-    await loadAmapProvinces(AMAP_PROVINCE_NAMES, { quiet: true, pages: 1, force: true });
-    applyFilters();
-    setMapStatus(`已按省份补充 ${formatNumber(state.allStations.length)} 个高德充电/换电 POI；点击省份可深度加载该省高速与城区点位。`);
+    setMapStatus("正在从高德逐步遍历全国比亚迪闪充 POI，本地库会持续变完整...");
+    try {
+      const payload = await fetchAmapCrawl({
+        provider: "BYD",
+        steps: 24,
+        pages: 5
+      });
+      mergeStations(payload.stations || []);
+      rememberLoadedRegions(payload.stations || []);
+      applyFilters();
+      const progress = payload.progress || {};
+      const progressText = progress.total
+        ? `进度 ${formatNumber(progress.cursor)}/${formatNumber(progress.total)}（${progress.percent}%）`
+        : "进度待统计";
+      setMapStatus(`本轮高德遍历新增 ${formatNumber(payload.added || 0)} 个点位，本地库 ${formatNumber(payload.localLibrary?.count || state.allStations.length)} 个；${progressText}。`);
+    } catch (error) {
+      console.error(error);
+      setMapStatus("高德逐步遍历失败，请稍后再试。");
+    }
   });
 }
 
