@@ -18,7 +18,7 @@ npm start
 - 地图低缩放按省份聚合显示点位数量，放大后进入城市聚合，再放大显示具体站点。
 - 点击省份会深度补充该省 POI，包含“比亚迪闪充服务区”“比亚迪闪充高速”“蔚来换电服务区”等高速/服务区关键词；拖动或缩放到具体区域时也会按当前地图范围补拉 POI。
 - 高德公开 POI 能返回站名、地址、经纬度、类型、部分营业时间、评分、更新时间等；公开 POI 接口暂未返回实时可用桩数量、排队状态和实时电价。
-- 高德 Key：已按你提供的 `33e77f9a83c7250dfbdda86ca642682c` 接入前端和本地服务。若高德控制台启用了安全密钥校验，需要在 `app.js` 的 `window._AMapSecurityConfig` 中补充 `securityJsCode`。
+- 高德 Key：已按你提供的 `XXXXXXXXXXXXXXXXXX` 接入前端和本地服务。若高德控制台启用了安全密钥校验，需要在 `app.js` 的 `window._AMapSecurityConfig` 中补充 `securityJsCode`。
 
 ## 数据字段
 
