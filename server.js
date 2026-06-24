@@ -139,12 +139,88 @@ function parsePoiLocation(location) {
   return { lng, lat };
 }
 
+function validationSignals({ provider, typecode, text }) {
+  const type = cleanText(typecode);
+  const haystack = cleanText(text);
+  const hasAmapChargeType = type === "011100" || /充电站|充电桩|超级充电|超充站|快充站/.test(haystack);
+  const hasAmapSwapType = type === "011101" || /换电站|充换电站|换电/.test(haystack);
+  const hasFlashSignal = /闪充|兆瓦|超充|超级充电/.test(haystack);
+  const hasBydStrongChargeName = /比亚迪闪充汽车充电站|比亚迪兆瓦闪充站|比亚迪超充站/.test(haystack);
+  const hasNioSwapSignal = /蔚来.*换电|NIO.*换电|换电站|充换电站/.test(haystack);
+
+  if (provider === "BYD") {
+    const valid = (hasAmapChargeType && hasFlashSignal) || hasBydStrongChargeName;
+    return {
+      valid,
+      kind: "byd-flash-charge",
+      signals: [
+        hasAmapChargeType ? "amap-charge-poi" : "",
+        hasFlashSignal ? "flash-keyword" : "",
+        hasBydStrongChargeName ? "strong-byd-charge-name" : ""
+      ].filter(Boolean)
+    };
+  }
+
+  if (provider === "NIO") {
+    const valid = hasAmapSwapType || hasNioSwapSignal;
+    return {
+      valid,
+      kind: "nio-swap",
+      signals: [
+        type === "011101" ? "amap-swap-typecode" : "",
+        hasAmapSwapType ? "swap-keyword" : "",
+        hasNioSwapSignal ? "nio-swap-name" : ""
+      ].filter(Boolean)
+    };
+  }
+
+  return { valid: false, kind: "unknown", signals: [] };
+}
+
+function poiValidationText(poi) {
+  return [
+    cleanText(poi.name),
+    cleanText(poi.address),
+    cleanText(poi.adname),
+    cleanText(poi.type),
+    cleanText(poi.keytag),
+    cleanText(poi.business_area)
+  ].join(" ");
+}
+
+function stationValidationText(station) {
+  return [
+    cleanText(station.name),
+    cleanText(station.address),
+    cleanText(station.district),
+    cleanText(station.city),
+    cleanText(station.province),
+    ...(Array.isArray(station.attributeTags) ? station.attributeTags.map(cleanText) : [])
+  ].join(" ");
+}
+
+function validatePoiForNetwork(poi, provider) {
+  return validationSignals({
+    provider,
+    typecode: cleanText(poi.typecode),
+    text: poiValidationText(poi)
+  });
+}
+
+function validateStationForLibrary(station) {
+  return validationSignals({
+    provider: station.provider,
+    typecode: cleanText(station.source?.typecode),
+    text: stationValidationText(station)
+  });
+}
+
 function inferCategory(poi, provider) {
-  if (provider === "NIO" || cleanText(poi.typecode) === "011101" || /换电/.test(cleanText(poi.type))) {
+  const text = `${cleanText(poi.name)} ${cleanText(poi.address)} ${cleanText(poi.business_area)} ${cleanText(poi.type)}`;
+  if (cleanText(poi.typecode) === "011101" || /换电/.test(text)) {
     return "换电站";
   }
 
-  const text = `${cleanText(poi.name)} ${cleanText(poi.address)} ${cleanText(poi.business_area)}`;
   if (/高速|服务区|收费站|枢纽|互通/.test(text)) return "高速站";
   if (/4S|汽车城|销售|展厅|体验中心|王朝|海洋|腾势|方程豹|仰望|门店|店/.test(text)) return "4S站";
   return "开放站";
@@ -168,9 +244,11 @@ function normalizePoi(poi, profile) {
   if (profile.provider === "NIO" && provider !== "NIO") return null;
   if (profile.provider === "AUTO" && provider !== "BYD" && provider !== "NIO") return null;
 
+  const validation = validatePoiForNetwork(poi, provider);
+  if (!validation.valid) return null;
+
   const category = inferCategory(poi, provider);
   const openTime = cleanText(poi.biz_ext?.open_time) || cleanText(poi.biz_ext?.opentime2);
-  const isFlash = /闪充|兆瓦|超充/i.test(searchable);
   const network = provider === "NIO" ? "蔚来换电" : "比亚迪高德充电";
   const id = `amap-${provider.toLowerCase()}-${cleanText(poi.id) || `${name}-${location.lng}-${location.lat}`}`;
 
@@ -187,16 +265,14 @@ function normalizePoi(poi, profile) {
     category,
     connectors: provider === "NIO"
       ? { swap: 1 }
-      : isFlash
-        ? { flash: 1 }
-        : { fast: 1 },
+      : { flash: 1 },
     available: {},
     price: { currentElecFee: null, currentServiceFee: null, periods: [] },
     businessHours: openTime || "以高德地图详情为准",
     parkFee: "以高德地图/现场为准",
     phone: cleanText(poi.tel),
     rating: cleanText(poi.biz_ext?.rating),
-    serviceTags: ["高德POI"],
+    serviceTags: ["高德POI", provider === "NIO" ? "高德换电确认" : "高德充电确认"],
     attributeTags: [cleanText(poi.keytag), cleanText(poi.type), cleanText(poi.business_area)].filter(Boolean),
     swapStatus: provider === "NIO" ? "以蔚来/高德实时信息为准" : "",
     source: {
@@ -208,7 +284,8 @@ function normalizePoi(poi, profile) {
       typecode: cleanText(poi.typecode),
       updatedAt: cleanText(poi.timestamp),
       availabilityNote: "高德公开 POI 接口未返回实时可用桩数量",
-      priceNote: "高德公开 POI 接口未返回实时电价"
+      priceNote: "高德公开 POI 接口未返回实时电价",
+      validation
     }
   };
 }
@@ -310,8 +387,33 @@ function sortStationsForLibrary(stations) {
   });
 }
 
+function uniqueStrings(items) {
+  return Array.from(new Set((items || []).map(cleanText).filter(Boolean)));
+}
+
+function prepareStationForLibrary(station) {
+  if (!station?.location) return null;
+  const validation = validateStationForLibrary(station);
+  if (!validation.valid) return null;
+  const provider = station.provider;
+  return {
+    ...station,
+    category: provider === "NIO" ? "换电站" : station.category,
+    connectors: provider === "NIO" ? { swap: 1 } : { flash: 1 },
+    serviceTags: uniqueStrings([
+      ...(Array.isArray(station.serviceTags) ? station.serviceTags : []),
+      provider === "NIO" ? "高德换电确认" : "高德充电确认"
+    ]),
+    source: {
+      ...(station.source || {}),
+      validation
+    }
+  };
+}
+
 function buildLocalLibrary(stations, updatedAt = new Date().toISOString()) {
-  const deduped = sortStationsForLibrary(dedupeStations((stations || []).filter((station) => station?.location)));
+  const prepared = (stations || []).map(prepareStationForLibrary).filter(Boolean);
+  const deduped = sortStationsForLibrary(dedupeStations(prepared));
   return {
     schema: localLibraryVersion,
     source: "local-library",
@@ -337,6 +439,15 @@ function readLocalLibrary() {
     localLibraryMemo.error = error.message;
   }
   return localLibraryMemo;
+}
+
+function readRawLocalLibrary() {
+  if (!fs.existsSync(localLibraryPath)) return emptyLocalLibrary();
+  try {
+    return JSON.parse(fs.readFileSync(localLibraryPath, "utf8"));
+  } catch (error) {
+    return { ...emptyLocalLibrary(), error: error.message };
+  }
 }
 
 function writeLocalLibrary(stations) {
@@ -367,6 +478,25 @@ function handleLocalLibrary(res) {
   send(res, 200, JSON.stringify({
     ...readLocalLibrary(),
     path: "data/amap-stations-cache.json"
+  }), "application/json; charset=utf-8");
+}
+
+function handleLocalLibraryRevalidate(res) {
+  const raw = readRawLocalLibrary();
+  const beforeStats = localLibraryStats(raw.stations || []);
+  const library = writeLocalLibrary(raw.stations || []);
+  send(res, 200, JSON.stringify({
+    source: "local-library-revalidate",
+    before: {
+      count: (raw.stations || []).length,
+      stats: beforeStats
+    },
+    after: {
+      count: library.count,
+      stats: library.stats
+    },
+    removed: Math.max(0, (raw.stations || []).length - library.count),
+    localLibrary: localLibraryMeta(library)
   }), "application/json; charset=utf-8");
 }
 
@@ -719,6 +849,10 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === "/api/amap/network") {
     handleAmapNetworkSearch(url, res);
+    return;
+  }
+  if (url.pathname === "/api/local-library/revalidate") {
+    handleLocalLibraryRevalidate(res);
     return;
   }
   if (url.pathname === "/api/local-library") {
