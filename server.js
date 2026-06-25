@@ -12,6 +12,9 @@ const cacheTtlMs = 10 * 60 * 1000;
 const dataDir = path.join(root, "data");
 const localLibraryPath = path.join(dataDir, "amap-stations-cache.json");
 const crawlStatePath = path.join(dataDir, "amap-crawl-state.json");
+const nioOfficialBaseUrl = "https://chargermap-fe-gateway.nio.com/pe/bff/gateway/powermap/h5";
+const nioOfficialMapUrl = "https://www.nio.cn/official-map";
+const nioOfficialResourceCode = "h5_charge_map_power_swap_resource_cdn_link";
 const localLibraryVersion = 1;
 let localLibraryMemo = null;
 const defaultCities = ["深圳市", "上海市", "北京市", "广州市", "杭州市", "苏州市", "南京市", "成都市", "武汉市", "西安市"];
@@ -137,6 +140,56 @@ function parsePoiLocation(location) {
   const [lng, lat] = cleanText(location).split(",").map(Number);
   if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null;
   return { lng, lat };
+}
+
+function parseLngLatPair(location) {
+  const [lng, lat] = cleanText(location).split(",").map(Number);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null;
+  return { lng, lat };
+}
+
+function inferAdminFromAddress(address) {
+  const text = cleanText(address);
+  const admin = { province: "", city: "", district: "" };
+  const provinceMatch = text.match(/^(北京市|天津市|上海市|重庆市|香港特别行政区|澳门特别行政区|内蒙古自治区|广西壮族自治区|宁夏回族自治区|新疆维吾尔自治区|西藏自治区|[^省]{2,12}省)/);
+  if (!provinceMatch) return admin;
+
+  admin.province = provinceMatch[1];
+  let rest = text.slice(admin.province.length);
+  if (/市$/.test(admin.province)) {
+    admin.city = admin.province;
+  } else {
+    const cityMatch = rest.match(/^([^市州盟地区]{1,16}(?:市|自治州|地区|盟))/);
+    if (cityMatch) {
+      admin.city = cityMatch[1];
+      rest = rest.slice(cityMatch[1].length);
+    }
+  }
+
+  const districtMatch = rest.match(/^([^区县市旗]{1,16}(?:区|县|市|旗))/);
+  if (districtMatch) admin.district = districtMatch[1];
+  if (!admin.city && admin.district) admin.city = admin.district;
+  if (!admin.city && /特别行政区$/.test(admin.province)) admin.city = admin.province;
+  return admin;
+}
+
+function adminFromAmapRegeo(payload) {
+  const component = payload?.regeocode?.addressComponent || {};
+  const province = cleanText(component.province);
+  const district = cleanText(component.district);
+  const city = cleanText(component.city) || (/市$/.test(province) || /特别行政区$/.test(province) ? province : district);
+  return {
+    province,
+    city,
+    district,
+    adcode: cleanText(component.adcode),
+    citycode: cleanText(component.citycode),
+    formattedAddress: cleanText(payload?.regeocode?.formatted_address)
+  };
+}
+
+function needsAdminSupplement(station) {
+  return !cleanText(station?.province) || !cleanText(station?.city);
 }
 
 function validationSignals({ provider, typecode, text }) {
@@ -302,6 +355,18 @@ function stationDedupeKey(station) {
   ].join("|");
 }
 
+function stationLocationMergeKey(station) {
+  const location = station.location || {};
+  const lng = Number(location.lng);
+  const lat = Number(location.lat);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return "";
+  return [
+    station.provider || "AUTO",
+    lng.toFixed(6),
+    lat.toFixed(6)
+  ].join("|");
+}
+
 function mergeSourceLabels(left, right) {
   return Array.from(new Set(
     `${cleanText(left)} / ${cleanText(right)}`
@@ -313,31 +378,48 @@ function mergeSourceLabels(left, right) {
 
 function dedupeStations(stations) {
   const map = new Map();
+  const preferredKeyByLocation = new Map();
   stations.forEach((station) => {
-    const key = stationDedupeKey(station);
-    const current = map.get(key);
-    if (!current) {
-      map.set(key, station);
-      return;
+    const poiId = cleanText(station.source?.poiId);
+    const locationKey = stationLocationMergeKey(station);
+    if (poiId && locationKey && !preferredKeyByLocation.has(locationKey)) {
+      preferredKeyByLocation.set(locationKey, stationDedupeKey(station));
     }
-
-    const currentTags = Array.isArray(current.attributeTags) ? current.attributeTags : [];
-    const stationTags = Array.isArray(station.attributeTags) ? station.attributeTags : [];
-    const keep = {
-      ...current,
-      phone: current.phone || station.phone,
-      rating: current.rating || station.rating,
-      category: current.category === "开放站" ? station.category : current.category,
-      businessHours: current.businessHours === "以高德地图详情为准" ? station.businessHours : current.businessHours,
-      source: {
-        ...current.source,
-        ...station.source,
-        label: mergeSourceLabels(current.source?.label, station.source?.label)
-      },
-      attributeTags: Array.from(new Set([...currentTags, ...stationTags]))
-    };
-    map.set(key, keep);
   });
+
+  stations
+    .slice()
+    .sort((left, right) => Number(Boolean(cleanText(right.source?.poiId))) - Number(Boolean(cleanText(left.source?.poiId))))
+    .forEach((station) => {
+      const poiId = cleanText(station.source?.poiId);
+      const locationKey = stationLocationMergeKey(station);
+      const key = !poiId && locationKey && preferredKeyByLocation.has(locationKey)
+        ? preferredKeyByLocation.get(locationKey)
+        : stationDedupeKey(station);
+      const current = map.get(key);
+      if (!current) {
+        map.set(key, station);
+        return;
+      }
+
+      const currentTags = Array.isArray(current.attributeTags) ? current.attributeTags : [];
+      const stationTags = Array.isArray(station.attributeTags) ? station.attributeTags : [];
+      const keep = {
+        ...current,
+        phone: current.phone || station.phone,
+        rating: current.rating || station.rating,
+        category: current.category === "开放站" ? station.category : current.category,
+        businessHours: current.businessHours === "以高德地图详情为准" ? station.businessHours : current.businessHours,
+        source: {
+          ...current.source,
+          ...station.source,
+          poiId: cleanText(current.source?.poiId) || cleanText(station.source?.poiId),
+          label: mergeSourceLabels(current.source?.label, station.source?.label)
+        },
+        attributeTags: Array.from(new Set([...currentTags, ...stationTags]))
+      };
+      map.set(key, keep);
+    });
   return Array.from(map.values());
 }
 
@@ -396,13 +478,19 @@ function prepareStationForLibrary(station) {
   const validation = validateStationForLibrary(station);
   if (!validation.valid) return null;
   const provider = station.provider;
+  const sourceConfidence = cleanText(station.source?.confidence);
+  const confirmationTag = sourceConfidence === "nio-official"
+    ? "蔚来官网换电确认"
+    : provider === "NIO"
+      ? "高德换电确认"
+      : "高德充电确认";
   return {
     ...station,
     category: provider === "NIO" ? "换电站" : station.category,
     connectors: provider === "NIO" ? { swap: 1 } : { flash: 1 },
     serviceTags: uniqueStrings([
       ...(Array.isArray(station.serviceTags) ? station.serviceTags : []),
-      provider === "NIO" ? "高德换电确认" : "高德充电确认"
+      confirmationTag
     ]),
     source: {
       ...(station.source || {}),
@@ -498,6 +586,357 @@ function handleLocalLibraryRevalidate(res) {
     removed: Math.max(0, (raw.stations || []).length - library.count),
     localLibrary: localLibraryMeta(library)
   }), "application/json; charset=utf-8");
+}
+
+function nioOfficialHeaders() {
+  return {
+    "accept": "application/json, text/plain, */*",
+    "origin": "https://chargermap.nio.com",
+    "referer": "https://chargermap.nio.com/pe/h5/static/chargermap?channel=official",
+    "user-agent": "Mozilla/5.0"
+  };
+}
+
+function buildNioOfficialUrl(pathname, params = {}) {
+  const pathPrefix = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  const url = new URL(`${nioOfficialBaseUrl}${pathPrefix}`);
+  const baseParams = {
+    app_ver: "5.2.0",
+    client: "pc",
+    container: "brower",
+    lang: "zh",
+    region: "CN",
+    app_id: "100119",
+    channel: "official",
+    brand: "nio",
+    timestamp: String(Date.now())
+  };
+  Object.entries({ ...baseParams, ...params }).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url;
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+    }
+    return JSON.parse(text);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchNioOfficialJson(pathname, params = {}) {
+  return fetchJsonWithTimeout(buildNioOfficialUrl(pathname, params), {
+    headers: nioOfficialHeaders()
+  });
+}
+
+async function fetchAmapRegeo(location) {
+  const upstream = new URL("https://restapi.amap.com/v3/geocode/regeo");
+  upstream.searchParams.set("key", amapKey);
+  upstream.searchParams.set("location", `${location.lng},${location.lat}`);
+  upstream.searchParams.set("extensions", "base");
+  upstream.searchParams.set("radius", "1000");
+  upstream.searchParams.set("roadlevel", "0");
+  upstream.searchParams.set("output", "json");
+  return fetchJsonWithTimeout(upstream, {}, 12000);
+}
+
+async function fetchAmapRegeoWithRetry(location) {
+  let lastRateLimitedPayload = null;
+  let lastError = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (attempt > 0) await sleep(1200 * attempt);
+    try {
+      const payload = await fetchAmapRegeo(location);
+      if (payload.infocode !== "10021") return payload;
+      lastRateLimitedPayload = payload;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (lastRateLimitedPayload) return lastRateLimitedPayload;
+  throw lastError || new Error("AMap regeo failed");
+}
+
+async function fetchNioOfficialSwapIndex() {
+  const dictionary = await fetchNioOfficialJson("/charge-map/v2/configs/dictionary", {
+    codes: nioOfficialResourceCode
+  });
+  if (dictionary.result_code !== "success" || !Array.isArray(dictionary.data)) {
+    throw new Error("NIO official dictionary request failed");
+  }
+
+  const linkValue = dictionary.data.find((item) => item.key === nioOfficialResourceCode)?.value;
+  const resourceUrls = cleanText(linkValue).split(";").map((item) => item.trim()).filter(Boolean);
+  if (!resourceUrls.length) {
+    throw new Error("NIO official swap resource link is empty");
+  }
+
+  const seen = new Set();
+  const items = [];
+  for (const resourceUrl of resourceUrls) {
+    const payload = await fetchJsonWithTimeout(resourceUrl, {
+      headers: {
+        "referer": "https://chargermap.nio.com/",
+        "user-agent": "Mozilla/5.0"
+      }
+    });
+    if (!Array.isArray(payload)) continue;
+    payload.forEach((item) => {
+      const key = cleanText(item.id) || cleanText(item.location);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      items.push({ ...item, resourceUrl });
+    });
+  }
+
+  return { items, resourceUrls };
+}
+
+async function fetchNioOfficialSwapDetail(item) {
+  const location = parseLngLatPair(item.location);
+  const params = {
+    swap_id: cleanText(item.id)
+  };
+  if (location) {
+    params.longitude = location.lng;
+    params.latitude = location.lat;
+  }
+  const payload = await fetchNioOfficialJson("/charge-map/v2/power-swap/detail", params);
+  if (payload.result_code !== "success" || !payload.data) {
+    throw new Error(payload.result_code || "detail missing");
+  }
+  return payload.data;
+}
+
+function normalizeNioOfficialStation(item, detail) {
+  const location = parseLngLatPair(item.location);
+  if (!location) return null;
+
+  const address = cleanText(detail?.address);
+  const admin = inferAdminFromAddress(address);
+  const officialId = cleanText(detail?.id) || crypto
+    .createHash("sha1")
+    .update(`${cleanText(item.id)}|${cleanText(item.location)}`)
+    .digest("hex");
+  const model = cleanText(detail?.model);
+  const swapSupportStatus = detail?.swap_support_status ?? null;
+
+  return {
+    id: `nio-official-${officialId}`,
+    provider: "NIO",
+    network: "蔚来换电",
+    name: cleanText(detail?.name) || "蔚来换电站（官网）",
+    city: admin.city,
+    province: admin.province,
+    district: admin.district,
+    address: address || "以蔚来官网详情为准",
+    location,
+    category: "换电站",
+    connectors: { swap: 1 },
+    available: { swapSupportStatus },
+    price: { currentElecFee: null, currentServiceFee: null, periods: [] },
+    businessHours: "以蔚来官网详情为准",
+    parkFee: "以蔚来官网/现场为准",
+    phone: "",
+    rating: "",
+    serviceTags: uniqueStrings(["蔚来官网", "蔚来官网换电确认", model]),
+    attributeTags: uniqueStrings(["PowerSwap", cleanText(detail?.type), model]),
+    swapStatus: swapSupportStatus === 1 ? "支持换电" : "以蔚来官网实时信息为准",
+    source: {
+      confidence: "nio-official",
+      label: "蔚来官网加电地图",
+      url: nioOfficialMapUrl,
+      capturedAt: new Date().toISOString(),
+      officialId,
+      resourceId: cleanText(item.id),
+      resourceUrl: cleanText(item.resourceUrl),
+      detailFetched: Boolean(detail),
+      validation: {
+        valid: true,
+        kind: "nio-swap",
+        signals: ["nio-official", "swap-keyword"]
+      }
+    }
+  };
+}
+
+async function supplementStationsAdmin(stations, concurrency, errors, delayMs = 0) {
+  const targets = stations.filter((station) => station?.location && needsAdminSupplement(station));
+  if (!targets.length) return { requested: 0, filled: 0, errors: 0 };
+
+  let filled = 0;
+  let errorCount = 0;
+  const regeoCache = new Map();
+
+  await mapLimit(targets, concurrency, async (station) => {
+    const key = `${Number(station.location.lng).toFixed(5)},${Number(station.location.lat).toFixed(5)}`;
+    try {
+      if (delayMs) await sleep(delayMs);
+      if (!regeoCache.has(key)) {
+        regeoCache.set(key, fetchAmapRegeoWithRetry(station.location));
+      }
+      const payload = await regeoCache.get(key);
+      if (payload.infocode !== "10000") {
+        throw new Error(`${payload.info || "AMap regeo failed"} (${payload.infocode || "unknown"})`);
+      }
+      const admin = adminFromAmapRegeo(payload);
+      if (!admin.province && !admin.city) return;
+
+      station.province = station.province || admin.province;
+      station.city = station.city || admin.city;
+      station.district = station.district || admin.district;
+      station.source = {
+        ...(station.source || {}),
+        adminSupplement: {
+          provider: "amap-regeo",
+          capturedAt: new Date().toISOString(),
+          adcode: admin.adcode,
+          citycode: admin.citycode,
+          formattedAddress: admin.formattedAddress
+        }
+      };
+      filled += 1;
+    } catch (error) {
+      errorCount += 1;
+      errors.push({
+        source: "amap-regeo",
+        station: station.name,
+        location: key,
+        error: error.message
+      });
+    }
+  });
+
+  return { requested: targets.length, filled, errors: errorCount };
+}
+
+async function handleLocalLibraryAdminSupplement(url, res) {
+  const concurrency = Math.max(1, Math.min(8, Number(url.searchParams.get("concurrency") || 2)));
+  const delay = Math.max(0, Math.min(3000, Number(url.searchParams.get("delay") || 200)));
+  const errors = [];
+
+  try {
+    const beforeLibrary = readLocalLibrary();
+    const beforeMissing = beforeLibrary.stations.filter(needsAdminSupplement).length;
+    const stations = beforeLibrary.stations.map((station) => ({ ...station }));
+    const adminSupplement = await supplementStationsAdmin(stations, concurrency, errors, delay);
+    const library = writeLocalLibrary(stations);
+    const afterMissing = library.stations.filter(needsAdminSupplement).length;
+
+    send(res, 200, JSON.stringify({
+      source: "local-library-admin-supplement",
+      queriedAt: new Date().toISOString(),
+      before: {
+        count: beforeLibrary.count,
+        missingAdmin: beforeMissing
+      },
+      after: {
+        count: library.count,
+        missingAdmin: afterMissing
+      },
+      adminSupplement,
+      localLibrary: localLibraryMeta(library),
+      errors
+    }), "application/json; charset=utf-8");
+  } catch (error) {
+    send(res, 502, JSON.stringify({
+      source: "local-library-admin-supplement",
+      error: "Local library admin supplement failed",
+      message: error.message
+    }), "application/json; charset=utf-8");
+  }
+}
+
+async function handleNioOfficialSync(url, res) {
+  const fetchDetails = url.searchParams.get("details") !== "false";
+  const replace = url.searchParams.get("replace") !== "false";
+  const fillAdmin = url.searchParams.get("regeo") !== "false";
+  const limit = Math.max(0, Math.min(6000, Number(url.searchParams.get("limit") || 0)));
+  const concurrency = Math.max(1, Math.min(12, Number(url.searchParams.get("concurrency") || 8)));
+  const regeoConcurrency = Math.max(1, Math.min(8, Number(url.searchParams.get("regeoConcurrency") || 4)));
+  const regeoDelay = Math.max(0, Math.min(3000, Number(url.searchParams.get("regeoDelay") || 120)));
+  const detailDelay = Math.max(0, Math.min(1000, Number(url.searchParams.get("detailDelay") || 0)));
+  const errors = [];
+
+  try {
+    const beforeLibrary = readLocalLibrary();
+    const beforeNio = beforeLibrary.stations.filter((station) => station.provider === "NIO").length;
+    const { items, resourceUrls } = await fetchNioOfficialSwapIndex();
+    const selectedItems = limit ? items.slice(0, limit) : items;
+    const detailMap = new Map();
+
+    if (fetchDetails) {
+      await mapLimit(selectedItems, concurrency, async (item, index) => {
+        if (detailDelay) await sleep(detailDelay * (index % concurrency));
+        try {
+          const detail = await fetchNioOfficialSwapDetail(item);
+          detailMap.set(cleanText(item.id), detail);
+        } catch (error) {
+          errors.push({
+            resourceId: cleanText(item.id),
+            location: cleanText(item.location),
+            error: error.message
+          });
+        }
+      });
+    }
+
+    const stations = selectedItems
+      .map((item) => normalizeNioOfficialStation(item, detailMap.get(cleanText(item.id))))
+      .filter(Boolean);
+    const detailErrorCount = errors.length;
+    const adminSupplement = fillAdmin
+      ? await supplementStationsAdmin(stations, regeoConcurrency, errors, regeoDelay)
+      : { requested: 0, filled: 0, errors: 0 };
+    const baseStations = replace
+      ? beforeLibrary.stations.filter((station) => station.provider !== "NIO")
+      : beforeLibrary.stations;
+    const library = writeLocalLibrary([...baseStations, ...stations]);
+    const afterNio = library.stations.filter((station) => station.provider === "NIO").length;
+
+    send(res, 200, JSON.stringify({
+      source: "nio-official",
+      queriedAt: new Date().toISOString(),
+      officialTotal: items.length,
+      synced: stations.length,
+      detailFetched: detailMap.size,
+      detailErrors: detailErrorCount,
+      adminSupplement,
+      replaced: replace ? beforeNio : 0,
+      before: {
+        count: beforeLibrary.count,
+        nio: beforeNio
+      },
+      after: {
+        count: library.count,
+        nio: afterNio
+      },
+      added: library.count - beforeLibrary.count,
+      resourceUrls,
+      localLibrary: localLibraryMeta(library),
+      errors
+    }), "application/json; charset=utf-8");
+  } catch (error) {
+    send(res, 502, JSON.stringify({
+      source: "nio-official",
+      error: "NIO official sync failed",
+      message: error.message
+    }), "application/json; charset=utf-8");
+  }
 }
 
 function readCrawlState() {
@@ -855,12 +1294,20 @@ const server = http.createServer((req, res) => {
     handleLocalLibraryRevalidate(res);
     return;
   }
+  if (url.pathname === "/api/local-library/admin-supplement") {
+    handleLocalLibraryAdminSupplement(url, res);
+    return;
+  }
   if (url.pathname === "/api/local-library") {
     handleLocalLibrary(res);
     return;
   }
   if (url.pathname === "/api/amap/crawl") {
     handleAmapCrawl(url, res);
+    return;
+  }
+  if (url.pathname === "/api/nio/official/sync") {
+    handleNioOfficialSync(url, res);
     return;
   }
 

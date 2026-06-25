@@ -11,7 +11,9 @@ npm start
 
 ## 数据口径
 
-- 当前主数据源已切换为高德 Web 服务 POI 搜索，本地接口为 `/api/amap/network`。
+- 当前本地库优先读取 `data/amap-stations-cache.json`；页面启动时先显示本地库，再按视野/城市补充新 POI。
+- BYD 闪充当前主数据源为高德 Web 服务 POI 搜索，本地接口为 `/api/amap/network`、增量遍历接口为 `/api/amap/crawl`。
+- 蔚来换电已切换为蔚来官网加电地图官方源，本地接口为 `/api/nio/official/sync`；同步时会替换旧 NIO 高德 POI，并用高德逆地理补齐省市区统计字段。
 - 高德接口每次命中的站点会自动合并到本地库 `data/amap-stations-cache.json`；页面启动时优先读取 `/api/local-library`，有缓存时先显示本地库，再后台补新。
 - 左侧“逐步更新”会调用 `/api/amap/crawl`，按城市/省份/关键词/页码从高德逐批遍历全国 BYD 闪充 POI；每一批新增点都会继续沉淀到本地库。城市输入框仍用于“加载城市”的即时补充。
 - 默认关键词覆盖：`比亚迪闪充`、`比亚迪兆瓦闪充`、`蔚来换电站`。
@@ -22,6 +24,7 @@ npm start
 - 点击省份会深度补充该省 POI，包含“比亚迪闪充服务区”“比亚迪闪充高速”“蔚来换电服务区”等高速/服务区关键词；拖动或缩放到具体区域时也会按当前地图范围补拉 POI。
 - 高德公开 POI 能返回站名、地址、经纬度、类型、部分营业时间、评分、更新时间等；公开 POI 接口暂未返回实时可用桩数量、排队状态和实时电价。
 - 高德 Key：已按你提供的 `XXXXXXXXXXXXXXXXXX` 接入前端和本地服务。若高德控制台启用了安全密钥校验，需要在 `app.js` 的 `window._AMapSecurityConfig` 中补充 `securityJsCode`。
+- 本地库维护接口：`/api/local-library/revalidate` 可重算去重与统计；`/api/local-library/admin-supplement` 可对缺省市点位做坐标反查补全。
 
 ## 数据字段
 
